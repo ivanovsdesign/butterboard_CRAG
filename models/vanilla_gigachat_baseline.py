@@ -1,16 +1,29 @@
+import os
+from typing import Any, Dict, List
+import httpx
+import json
+import requests
+import uuid
+from datetime import datetime, timedelta
+import logging
+
+# Load environment variables from .env file
+from dotenv import dotenv_values
+
+config = dotenv_values(".env")
+
+# GigaChat API Configuration
+GIGACHAT_API_KEY = config["GIGACHAT_API_KEY"]
+GIGACHAT_MODEL = config["GIGACHAT_MODEL"]
+GIGACHAT_API_URL = "https://gigachat.devices.sberbank.ru/api/v1"
+CA_CERT_PATH = "cert/russiantrustedca.pem"  # Path to the CA certificate file
+
+
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
-
-import os
-from typing import Any, Dict, List
-
-import numpy as np
-import torch
-import vllm
-from models.utils import trim_predictions_to_max_token_length
 
 ######################################################################################################
 ######################################################################################################
@@ -36,10 +49,6 @@ CRAG_MOCK_API_URL = os.getenv("CRAG_MOCK_API_URL", "http://localhost:8000")
 # Batch size you wish the evaluators will use to call the `batch_generate_answer` function
 BATCH_SIZE = 8  # TUNE THIS VARIABLE depending on the number of GPUs you are requesting and the size of your model.
 
-# VLLM Parameters
-VLLM_TENSOR_PARALLEL_SIZE = 4  # TUNE THIS VARIABLE depending on the number of GPUs you are requesting and the size of your model.
-VLLM_GPU_MEMORY_UTILIZATION = 0.85  # TUNE THIS VARIABLE depending on the number of GPUs you are requesting and the size of your model.
-
 #### CONFIG PARAMETERS END---
 
 
@@ -52,29 +61,34 @@ class InstructModel:
         """
         self.initialize_models()
 
-    def initialize_models(self):
-        # Initialize Meta Llama 3 - 8B Instruct Model
-        self.model_name = "models/meta-llama/Meta-Llama-3-8B-Instruct"
+    def get_sber_api_key(self) -> tuple:
+        url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
 
-        if not os.path.exists(self.model_name):
-            raise Exception(
-                f"""
-            The evaluators expect the model weights to be checked into the repository,
-            but we could not find the model weights at {self.model_name}
-            """
-            )
+        self.request_id = uuid.uuid4()
 
-        # initialize the model with vllm
-        self.llm = vllm.LLM(
-            self.model_name,
-            worker_use_ray=True,
-            tensor_parallel_size=VLLM_TENSOR_PARALLEL_SIZE,
-            gpu_memory_utilization=VLLM_GPU_MEMORY_UTILIZATION,
-            trust_remote_code=True,
-            dtype="half",  # note: update the dtype based on the available GPU
-            enforce_eager=True,
+        payload = "scope=GIGACHAT_API_PERS"
+        headers = {
+            "RqUID": f"{str(self.request_id)}",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Authorization": f"Bearer {GIGACHAT_API_KEY}",
+        }
+
+        response = requests.request(
+            "POST", url, headers=headers, data=payload, verify=False
         )
-        self.tokenizer = self.llm.get_tokenizer()
+
+        sber_api_response = response.json()
+
+        self.api_token = sber_api_response.get("access_token", "Unknown")
+        self.exp_timestamp = sber_api_response.get("expires_at", "Unknown")
+
+        return self.api_token, self.exp_timestamp, self.request_id
+
+    def initialize_models(self):
+        # Initialize HTTP client for GigaChat API
+        # self.client = httpx.Client(verify=CA_CERT_PATH)
+        self.client = httpx.Client(verify=False)
+        self.get_sber_api_key()
 
     def get_batch_size(self) -> int:
         """
@@ -110,65 +124,57 @@ class InstructModel:
         - Response Time: Ensure that your model processes and responds to each query within 30 seconds.
           Failing to adhere to this time constraint **will** result in a timeout during evaluation.
         """
-        batch_interaction_ids = batch["interaction_id"]
+
+        current_time = datetime.now()
+
+        if current_time >= datetime.fromtimestamp(
+            self.exp_timestamp / 1000
+        ) - timedelta(minutes=1):
+            logging.info("Sber API key is about to expire, refreshing...")
+            self.api_token, self.exp_timestamp, _ = self.get_sber_api_key()
+
         queries = batch["query"]
-        batch_search_results = batch["search_results"]
-        query_times = batch["query_time"]
+        formatted_prompts = self.format_prompts(queries)
 
-        formatted_prompts = self.format_prommpts(queries, query_times)
-
-        # Generate responses via vllm
-        breakpoint()
-        responses = self.llm.generate(
-            formatted_prompts,
-            vllm.SamplingParams(
-                n=1,  # Number of output sequences to return for each prompt.
-                top_p=0.9,  # Float that controls the cumulative probability of the top tokens to consider.
-                temperature=0.1,  # randomness of the sampling
-                skip_special_tokens=True,  # Whether to skip special tokens in the output.
-                max_tokens=50,  # Maximum number of tokens to generate per output sequence.
-                # Note: We are using 50 max new tokens instead of 75,
-                # because the 75 max token limit is checked using the Llama2 tokenizer.
-                # The Llama3 model instead uses a differet tokenizer with a larger vocabulary
-                # This allows it to represent the same content more efficiently, using fewer tokens.
-            ),
-            use_tqdm=False,
-        )
+        # Generate responses via GigaChat API
+        headers = {
+            "Authorization": f"Bearer {self.api_token}",
+            "Content-Type": "application/json",
+        }
+        responses = []
+        for prompt in formatted_prompts:
+            response = self.client.post(
+                f"{GIGACHAT_API_URL}/chat/completions",
+                headers=headers,
+                data=json.dumps({"model": f"{GIGACHAT_MODEL}", "messages": prompt}),
+            )
+            response_data = response.json()
+            responses.append(response_data["choices"][0]["message"]["content"])
 
         # Aggregate answers into List[str]
         answers = []
         for response in responses:
-            answers.append(response.outputs[0].text)
+            answers.append(response[:75])
 
         return answers
 
-    def format_prommpts(self, queries, query_times):
+    def format_prompts(self, queries):
         """
-        Formats queries and corresponding query_times using the chat_template of the model.
+        Formats queries using the chat_template of the model.
 
         Parameters:
         - queries (list of str): A list of queries to be formatted into prompts.
-        - query_times (list of str): A list of query_time strings corresponding to each query.
 
         """
-        system_prompt = "You are provided with a question and various references. Your task is to answer the question succinctly, using the fewest words possible. If the references do not contain the necessary information to answer the question, respond with 'I don't know'."
+        system_prompt = {
+            "role": "system",
+            "content": "You are provided with a question and various references. Your task is to answer the question succinctly, using the fewest words possible. If the references do not contain the necessary information to answer the question, respond with 'I don't know'.",
+        }
         formatted_prompts = []
 
-        for _idx, query in enumerate(queries):
-            query_time = query_times[_idx]
-            user_message = ""
-            user_message += f"Current Time: {query_time}\n"
-            user_message += f"Question: {query}\n"
+        for query in queries:
+            user_message = {"role": "user", "content": f"Question: {query}\n"}
 
-            formatted_prompts.append(
-                self.tokenizer.apply_chat_template(
-                    [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_message},
-                    ],
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
-            )
+            formatted_prompts.append([system_prompt, user_message])
 
         return formatted_prompts
