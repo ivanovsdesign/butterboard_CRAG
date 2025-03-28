@@ -159,7 +159,7 @@ def load_data_in_batches(dataset_path, batch_size):
                         yield batch
                         batch = initialize_batch()
                 except json.JSONDecodeError:
-                    logger.warn("Warning: Failed to decode a line.")
+                    logger.warning("Warning: Failed to decode a line.")
             # Yield any remaining data as the last batch
             if batch["query"]:
                 yield batch
@@ -222,7 +222,7 @@ def evaluate_predictions(
     results_df['is_missed'] = False
     results_df['is_correct'] = False
     results_df['is_hallucination'] = False
-    results_df['participant_model'] = UserModel.__name__
+    results_df['participant_model'] = config['PARTICIPANT_MODEL']
     results_df['evaluation_model'] = evaluation_model_name
 
     system_message = get_system_message()
@@ -254,8 +254,8 @@ def evaluate_predictions(
                 break
 
             # Check for 'некоррект' in both prediction and ground truth
-            pred_incorrect = 'некоррект' in prediction_lower
-            gt_incorrect = 'некоррект' in gt_lower
+            pred_incorrect = ('некоррект' in prediction_lower) or ('invalid' in prediction_lower)
+            gt_incorrect = ('некоррект' in gt_lower) or ('invalid' in gt_lower)
 
             if pred_incorrect and gt_incorrect:
                 accuracy = 1
@@ -328,6 +328,7 @@ if __name__ == "__main__":
     from models.user_config import UserModel
 
     DATASET_PATH = "data/russian_crag_test.jsonl.bz2"
+    dataset_slug = DATASET_PATH.split('/')[1].split('.')[0]
 
     # Generate predictions
     participant_model = UserModel()
@@ -342,14 +343,14 @@ if __name__ == "__main__":
          'predictions':predictions}
     )
     
-    results.to_csv('results.csv')
+    results.to_csv(f'results_{dataset_slug}_{config['PARTICIPANT_MODEL']}.csv')
     
     # Evaluate Predictions
-    openai_client = OpenAI(
-        api_key=config["OPENAI_API_KEY"], base_url="https://openrouter.ai/api/v1"
-    )
-    metrics, evaluation_df = evaluate_predictions(
-        results, config['OPENAI_MODEL'], openai_client
-    )
+    # openai_client = OpenAI(
+    #     api_key=config["OPENAI_API_KEY"], base_url="https://openrouter.ai/api/v1"
+    # )
+    # metrics, evaluation_df = evaluate_predictions(
+    #     results, config['OPENAI_MODEL'], openai_client
+    # )
     
-    evaluation_df.to_csv('evaluation.csv')
+    # evaluation_df.to_csv(f'results_{dataset_slug}_{config['PARTICIPANT_MODEL']}_{config['OPENAI_MODEL]}.csv')
