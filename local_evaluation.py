@@ -19,6 +19,17 @@ from prompts.templates import IN_CONTEXT_EXAMPLES, INSTRUCTIONS
 from tqdm.auto import tqdm
 from transformers import LlamaTokenizerFast
 
+import csv
+from tqdm import tqdm
+import os
+
+import csv
+import os
+from filelock import FileLock
+from tqdm import tqdm
+import time
+from datetime import datetime
+
 # from auto_gptq import AutoGPTQForCausalLM, BaseQuantizeConfig
 
 tokenizer = LlamaTokenizerFast.from_pretrained("tokenizer")
@@ -170,34 +181,66 @@ def load_data_in_batches(dataset_path, batch_size):
         logger.error(f"Error: An error occurred while reading the file {dataset_path}.")
         raise e
 
-
-def generate_predictions(dataset_path, participant_model):
+def generate_predictions(dataset_path, participant_model, dataset_slug, config):
     """
-    Processes batches of data from a dataset to generate predictions using a model.
-
-    Args:
-    dataset_path (str): Path to the dataset.
-    participant_model (object): UserModel that provides `get_batch_size()` and `batch_generate_answer()` interfaces.
-
-    Returns:
-    tuple: A tuple containing lists of queries, ground truths, and predictions.
+    Processes batches and writes to JSONL with proper escaping for multi-line outputs.
+    Includes full metadata and maintains thread-safe operations.
     """
-    queries, ground_truths, predictions = [], [], []
+    output_file = f"results_{dataset_slug}_{config['PARTICIPANT_MODEL']}.jsonl"
+    lock_file = f"{output_file}.lock"
+    model_name = config['PARTICIPANT_MODEL']
+
+    # Initialize file if needed (with locking)
+    if not os.path.exists(output_file):
+        with FileLock(lock_file, timeout=30):
+            # Double-check after acquiring lock
+            if not os.path.exists(output_file):
+                try:
+                    # Just create empty file - JSONL doesn't need headers
+                    open(output_file, 'w', encoding='utf-8').close()
+                    print(f"Created new JSONL results file: {output_file}")
+                except Exception as e:
+                    print(f"Failed to initialize file: {e}")
+                    raise
+
     batch_size = participant_model.get_batch_size()
+    processed_rows = 0
 
-    for batch in tqdm(
-        load_data_in_batches(dataset_path, batch_size), desc="Generating predictions"
-    ):
-        batch_ground_truths = batch.pop(
-            "answer"
-        )  # Remove answers from batch and store them
-        batch_predictions = participant_model.batch_generate_answer(batch)
-        print(batch_predictions)
-        queries.extend(batch["query"])
-        ground_truths.extend(batch_ground_truths)
-        predictions.extend(batch_predictions)
+    for batch in tqdm(load_data_in_batches(dataset_path, batch_size),
+                     desc=f"Generating ({model_name} on {dataset_slug})"):
+        try:
+            start_time = time.time()
+            batch_ground_truths = batch.pop("answer")
+            batch_predictions = participant_model.batch_generate_answer(batch)
+            processing_time_ms = int((time.time() - start_time) * 1000)
+            timestamp = datetime.now().isoformat()
 
-    return queries, ground_truths, predictions
+            # Atomic write operation with locking
+            with FileLock(lock_file, timeout=10):
+                with open(output_file, 'a', encoding='utf-8') as f:
+                    for query, truth, pred in zip(batch["query"], 
+                                                batch_ground_truths, 
+                                                batch_predictions):
+                        record = {
+                            "dataset_slug": dataset_slug,
+                            "participant_model": model_name,
+                            "query": query,
+                            "ground_truth": truth,
+                            "prediction": pred,
+                            "timestamp": timestamp,
+                            "processing_time_ms": processing_time_ms,
+                            "batch_size": batch_size
+                        }
+                        f.write(json.dumps(record, ensure_ascii=False) + '\n')
+                        processed_rows += 1
+
+        except Exception as e:
+            print(f"Batch processing failed: {str(e)[:200]}...")
+            time.sleep(1)
+            continue
+
+    print(f"Successfully processed {processed_rows} rows to {output_file}")
+    return output_file
 
 
 def evaluate_predictions(
@@ -222,7 +265,6 @@ def evaluate_predictions(
     results_df['is_missed'] = False
     results_df['is_correct'] = False
     results_df['is_hallucination'] = False
-    results_df['participant_model'] = config['PARTICIPANT_MODEL']
     results_df['evaluation_model'] = evaluation_model_name
 
     system_message = get_system_message()
@@ -235,7 +277,7 @@ def evaluate_predictions(
         prediction_lower = prediction.lower()
 
         # Check if the prediction is a miss
-        if 'я не знаю' in prediction_lower:
+        if ('я не знаю' in prediction_lower) or ("i don't know" in prediction_lower):
             results_df.at[idx, 'is_missed'] = True
             results_df.at[idx, 'is_correct'] = False
             results_df.at[idx, 'is_hallucination'] = False
@@ -327,23 +369,22 @@ def evaluate_predictions(
 if __name__ == "__main__":
     from models.user_config import UserModel
 
-    DATASET_PATH = "data/russian_crag_test.jsonl.bz2"
+    DATASET_PATH = "data/sampled_questions_distribution.jsonl.bz2"
     dataset_slug = DATASET_PATH.split('/')[1].split('.')[0]
 
     # Generate predictions
     participant_model = UserModel()
-    queries, ground_truths, predictions = generate_predictions(
-        DATASET_PATH, participant_model
-    )
+    
+    generate_predictions(
+            dataset_path=DATASET_PATH,
+            participant_model=participant_model,
+            dataset_slug=dataset_slug,
+            config=config
+        )
     
     #results = pd.DataFrame([queries, ground_truths, predictions], columns=['queries', 'ground_truths', 'predictions'])
-    results = pd.DataFrame(
-        {'queries':queries,
-         'ground_truths':ground_truths,
-         'predictions':predictions}
-    )
     
-    results.to_csv(f'results_{dataset_slug}_{config['PARTICIPANT_MODEL']}.csv')
+    #results.to_csv(f"results_{dataset_slug}_{config['PARTICIPANT_MODEL']}.csv")
     
     # Evaluate Predictions
     # openai_client = OpenAI(
@@ -353,4 +394,4 @@ if __name__ == "__main__":
     #     results, config['OPENAI_MODEL'], openai_client
     # )
     
-    # evaluation_df.to_csv(f'results_{dataset_slug}_{config['PARTICIPANT_MODEL']}_{config['OPENAI_MODEL]}.csv')
+    # evaluation_df.to_csv(f"results_{dataset_slug}_{config['PARTICIPANT_MODEL']}_{config['OPENAI_MODEL]}.csv")

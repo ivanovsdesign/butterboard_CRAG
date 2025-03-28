@@ -109,7 +109,7 @@ class InstructModel:
         # Aggregate answers into List[str]
         answers = []
         for response in responses:
-            answers.append(response.text[:75])
+            answers.append(response.text)
 
         return answers
 

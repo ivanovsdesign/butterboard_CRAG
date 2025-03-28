@@ -6,6 +6,9 @@
 
 import os
 import json
+import hashlib
+import pickle
+from pathlib import Path
 from collections import defaultdict
 from typing import Any, Dict, List
 from dotenv import dotenv_values
@@ -16,7 +19,10 @@ import torch
 from blingfire import text_to_sentences_and_offsets
 from bs4 import BeautifulSoup
 from loguru import logger
-from yandex_chain import YandexLLM, YandexEmbeddings, YandexGPTModel
+
+from langchain_gigachat.embeddings.gigachat import GigaChatEmbeddings
+from langchain_gigachat.chat_models import GigaChat
+
 from sklearn.metrics.pairwise import cosine_similarity
 
 ######################################################################################################
@@ -32,7 +38,7 @@ MAX_CONTEXT_SENTENCE_LENGTH = 500
 # Set the maximum context references length (in characters).
 MAX_CONTEXT_REFERENCES_LENGTH = 4000
 
-EMBEDDING_SIZE = 256
+EMBEDDING_SIZE = 1024
 
 WINDOW_SIZE = 3  # Sentences per chunk
 OVERLAP = 1
@@ -42,21 +48,42 @@ SUBMISSION_BATCH_SIZE = 8
 
 config = dotenv_values('.env')
 
-MODEL = config['YANDEX_MODEL']
+MODEL = config['GIGACHAT_MODEL']
 
-# Yandex API configuration
-def get_model(model = MODEL):
-    match model:
-        case 'yandexgpt_lite':
-            return YandexGPTModel.Lite
-        case 'yandexgpt_pro':
-            return YandexGPTModel.Pro
-        
-    
+# Cache configuration
+EMBEDDING_CACHE_DIR = Path(".embedding_cache")
+EMBEDDING_CACHE_DIR.mkdir(exist_ok=True)
 
 ######################################################################################################
 # Model Implementation
 ######################################################################################################
+
+class EmbeddingCache:
+    @staticmethod
+    def get_cache_key(text: str) -> str:
+        """Generate a consistent cache key for the given text"""
+        return hashlib.md5(text.encode('utf-8')).hexdigest()
+    
+    @staticmethod
+    def get_cache_path(text: str) -> Path:
+        """Get the cache file path for the given text"""
+        return EMBEDDING_CACHE_DIR / f"{EmbeddingCache.get_cache_key(text)}.pkl"
+    
+    @staticmethod
+    def load_from_cache(text: str) -> np.ndarray:
+        """Load embedding from cache if exists"""
+        cache_path = EmbeddingCache.get_cache_path(text)
+        if cache_path.exists():
+            with open(cache_path, 'rb') as f:
+                return pickle.load(f)
+        return None
+    
+    @staticmethod
+    def save_to_cache(text: str, embedding: np.ndarray):
+        """Save embedding to cache"""
+        cache_path = EmbeddingCache.get_cache_path(text)
+        with open(cache_path, 'wb') as f:
+            pickle.dump(embedding, f)
 
 class ChunkExtractor:
     @ray.remote
@@ -65,7 +92,7 @@ class ChunkExtractor:
         # Enhanced HTML cleaning
         soup = BeautifulSoup(html_source, "lxml")
         
-        print('Extracting chunks')
+        logger.info('Extracting chunks')
         
         # Remove non-content elements
         for element in soup(['script', 'style', 'header', 'footer', 'nav']):
@@ -110,7 +137,7 @@ class ChunkExtractor:
         """
         # Setup parallel chunk extraction using ray remote
         
-        print('Extract chunks. Enter for loop')
+        logger.info('Extract chunks. Enter for loop')
         
         ray_response_refs = [
             self._extract_chunks.remote(
@@ -122,7 +149,7 @@ class ChunkExtractor:
             for html_text in search_results
         ]
         
-        print('Extract chunks. Exit for loop')
+        logger.info('Extract chunks. Exit for loop')
 
         # Wait until all sentence extractions are complete
         # and collect chunks for every interaction_id separately
@@ -152,7 +179,7 @@ class ChunkExtractor:
         chunks = []
         chunk_interaction_ids = []
         
-        print('Flatten chunks. Enter for loop')
+        logger.info('Flatten chunks. Enter for loop')
 
         for interaction_id, _chunks in chunk_dictionary.items():
             # De-duplicate chunks within the scope of an interaction ID
@@ -160,7 +187,7 @@ class ChunkExtractor:
             chunks.extend(unique_chunks)
             chunk_interaction_ids.extend([interaction_id] * len(unique_chunks))
             
-        print('Flatten chunks. Exit for loop')
+        logger.info('Flatten chunks. Exit for loop')
 
         # Convert to numpy arrays for convenient slicing/masking operations later
         chunks = np.array(chunks)
@@ -171,7 +198,7 @@ class ChunkExtractor:
 
 class RAGModel:
     """
-    Modified RAGModel using YandexGPT and Yandex Embeddings
+    Modified RAGModel using SberGPT and Sber Embeddings
     """
 
     def __init__(self):
@@ -179,30 +206,32 @@ class RAGModel:
         self.chunk_extractor = ChunkExtractor()
 
     def initialize_models(self):
-        """Initialize Yandex models instead of Llama and SentenceTransformer"""
+        """Initialize Sber models instead of Llama and SentenceTransformer"""
         
         if not config:
             raise Exception(
-                f"Yandex API configuration file not found in .env "
-                "Please provide a valid configuration file for Yandex services."
+                f"Sber configuration file not found in .env "
+                "Please provide a valid configuration file for Sber services."
             )
         
-        # Initialize Yandex Embeddings model
-        self.embedding_model = YandexEmbeddings(
-                                    api_key=config['YCLOUD_API_TOKEN'],
-                                    folder_id = config['YCLOUD_FOLDER_ID']
-                                    )
+        # Initialize Sber Embeddings model
+        self.embedding_model = GigaChatEmbeddings(
+                credentials=config['GIGACHAT_API_KEY'],
+                scope="GIGACHAT_API_PERS",
+                verify_ssl_certs=False,
+            )
         
-        # Initialize Yandex LLM
-        self.llm = YandexLLM(
-                    api_key=config['YCLOUD_API_TOKEN'],
-                    folder_id = config['YCLOUD_FOLDER_ID'],
-                    model = get_model()
-                    )
+        # Initialize Sber LLM
+        self.llm = GigaChat(
+                credentials=config['GIGACHAT_API_KEY'],
+                scope="GIGACHAT_API_PERS",
+                model=MODEL,
+                verify_ssl_certs=False,
+            )
 
     def calculate_embeddings(self, sentences):
         """
-        Compute embeddings using Yandex Embeddings API.
+        Compute embeddings using Sber Embeddings API with caching.
         """
         # Handle empty input for both numpy arrays and regular lists
         if sentences is None or (hasattr(sentences, '__len__') and len(sentences) == 0):
@@ -216,20 +245,45 @@ class RAGModel:
             sentences = [sentences]
             
         try:
-            print('Getting embeddings from Yandex')
-            # Get embeddings from Yandex
-            #embeddings = self.embedding_model.embed_query(sentences)
+            logger.info('Getting embeddings from Sber')
             
             embeddings = []
+            uncached_texts = []
+            cache_indices = []
             
-            for sentence in sentences:
-                if not sentence: 
-                    logger.info('Embedding is empty')
-                    embeddings.append(np.zeros(EMBEDDING_SIZE))
-                    continue
-                embedding = self.embedding_model.embed_query(sentence)
-                embeddings.append(embedding)
+            # Check cache first
+            for i, text in enumerate(sentences):
+                cached_embedding = EmbeddingCache.load_from_cache(text)
+                if cached_embedding is not None:
+                    embeddings.append(cached_embedding)
+                else:
+                    uncached_texts.append(text)
+                    cache_indices.append(i)
             
+            # Only compute embeddings for uncached texts
+            if uncached_texts:
+                logger.info(f'Computing embeddings for {len(uncached_texts)} uncached texts')
+                new_embeddings = self.embedding_model.embed_documents(texts=uncached_texts)
+                
+                # Cache the new embeddings
+                for text, embedding in zip(uncached_texts, new_embeddings):
+                    EmbeddingCache.save_to_cache(text, embedding)
+                
+                # Merge cached and new embeddings
+                temp_embeddings = embeddings.copy()
+                embeddings = []
+                cached_idx = 0
+                new_idx = 0
+                
+                for i in range(len(sentences)):
+                    if i in cache_indices:
+                        embeddings.append(new_embeddings[new_idx])
+                        new_idx += 1
+                    else:
+                        embeddings.append(temp_embeddings[cached_idx])
+                        cached_idx += 1
+            
+            logger.info('Embeddings created/loaded')
             return np.array(embeddings)
         except Exception as e:
             logger.error(f"Error calculating embeddings: {e}")
@@ -242,6 +296,8 @@ class RAGModel:
         return SUBMISSION_BATCH_SIZE
 
     def batch_generate_answer(self, batch: Dict[str, Any]) -> List[str]:
+        self.initialize_models()
+        
         batch_interaction_ids = batch["interaction_id"]
         queries = batch["query"]
         batch_search_results = batch["search_results"]
@@ -278,7 +334,7 @@ class RAGModel:
 
             retrieval_results = relevant_chunks[
                 (-cosine_scores).argsort()[:NUM_CONTEXT_SENTENCES]
-            ]  # Fixed missing closing bracket here
+            ]
             batch_retrieval_results.append(retrieval_results)
 
         # Format prompts and generate answers
@@ -290,17 +346,16 @@ class RAGModel:
         for prompt in formatted_prompts:
             try:
                 response = self.llm.invoke(prompt)
-                answers.append(response)
+                answers.append(response.model_dump())
             except Exception as e:
                 logger.error(f"Error generating answer: {e}")
                 answers.append("I don't know")
                 
         return answers
 
-
     def format_prompts(self, queries, query_times, batch_retrieval_results=[]):
         """
-        Formats prompts specifically for YandexGPT.
+        Formats prompts specifically for SberGPT.
         """
         system_prompt = """Тебе дан вопрос и данные с информацией. 
         Ответь на вопрос точно, используя только предоставленные данные. 
